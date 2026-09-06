@@ -1,0 +1,635 @@
+     1                                  ;============================================================
+     2                                  ;  MiniOS - 精简内核 (纯 NASM 汇编, 32位保护模式)
+     3                                  ;
+     4                                  ;  编译: nasm -f bin kernel.asm -o kernel.bin
+     5                                  ;  加载: 由 boot.bin 从磁盘读到 0x10000 (最多32KB)
+     6                                  ;
+     7                                  ;  功能: VGA文本模式 + PIT定时器 + 键盘IRQ + 简单shell
+     8                                  ;============================================================
+     9                                  
+    10                                          BITS 32
+    11                                          ORG 0x10000
+    12                                  
+    13                                  ;------------------------------------------------------------
+    14                                  ; 内核入口
+    15                                  ;------------------------------------------------------------
+    16                                  start:
+    17                                          ; 建立自己的实地址寻址指针 (保护模式下 base=0)
+    18 00000000 C605[01070000]1F                mov byte [current_color], 0x1F    ; 白字蓝底
+    19                                  
+    20                                          ; ---- 重映射 PIC ----
+    21 00000007 E8DA000000                      call remap_pic
+    22                                  
+    23                                          ; ---- 初始化 PIT 定时器 100Hz ----
+    24 0000000C E8FC000000                      call init_timer
+    25                                  
+    26                                          ; ---- 初始化键盘 ----
+    27 00000011 E808010000                      call clear_kb_buf
+    28                                  
+    29                                          ; ---- 设置 IDT ----
+    30 00000016 E810010000                      call setup_idt
+    31 0000001B 0F011D[500F0000]                lidt [idt_descriptor]
+    32                                  
+    33                                          ; ---- 启动画面 ----
+    34 00000022 E83C000000                      call clear_screen
+    35 00000027 BE[D5030000]                    mov esi, MSG_LOGO
+    36 0000002C C605[01070000]0E                mov byte [current_color], 0x0E    ; 黄字
+    37 00000033 E849000000                      call print_string
+    38 00000038 BE[04040000]                    mov esi, MSG_BANNER
+    39 0000003D C605[01070000]0B                mov byte [current_color], 0x0B    ; 青字
+    40 00000044 E838000000                      call print_string
+    41 00000049 BE[40040000]                    mov esi, MSG_HINT
+    42 0000004E C605[01070000]07                mov byte [current_color], 0x07    ; 灰字
+    43 00000055 E827000000                      call print_string
+    44                                  
+    45                                          ; ---- 打开中断 ----
+    46 0000005A FB                              sti
+    47                                  
+    48                                          ; ---- 提示符 ----
+    49 0000005B E8C0010000                      call print_prompt
+    50                                  
+    51                                  ;------------------------------------------------------------
+    52                                  ; 主循环: 等待键盘中断处理
+    53                                  ;------------------------------------------------------------
+    54                                  main_loop:
+    55 00000060 F4                              hlt
+    56 00000061 EBFD                            jmp main_loop
+    57                                  
+    58                                  ;------------------------------------------------------------
+    59                                  ; clear_screen: 填充 80x25 VGA 文本区
+    60                                  ;------------------------------------------------------------
+    61                                  clear_screen:
+    62 00000063 60                              pusha
+    63 00000064 BF00800B00                      mov edi, VIDEO_MEM
+    64 00000069 B9D0070000                      mov ecx, 2000
+    65 0000006E B820072007                      mov eax, 0x07200720
+    66 00000073 F3AB                            rep stosd
+    67 00000075 C705[02070000]0000-             mov dword [cursor_pos], 0
+    67 0000007D 0000               
+    68 0000007F 61                              popa
+    69 00000080 C3                              ret
+    70                                  
+    71                                  ;------------------------------------------------------------
+    72                                  ; print_string: 输出以0结尾字符串
+    73                                  ;   ESI = 地址, [current_color] = 颜色
+    74                                  ;------------------------------------------------------------
+    75                                  print_string:
+    76 00000081 60                              pusha
+    77                                  .loop:
+    78 00000082 AC                              lodsb
+    79 00000083 08C0                            or al, al
+    80 00000085 7412                            jz .done
+    81 00000087 3C0A                            cmp al, 0x0A
+    82 00000089 7407                            je .nl
+    83 0000008B E80B000000                      call print_char
+    84 00000090 EBF0                            jmp .loop
+    85                                  .nl:
+    86 00000092 E835000000                      call print_newline
+    87 00000097 EBE9                            jmp .loop
+    88                                  .done:
+    89 00000099 61                              popa
+    90 0000009A C3                              ret
+    91                                  
+    92                                  ;------------------------------------------------------------
+    93                                  ; print_char: AL = 字符, [current_color] = 颜色
+    94                                  ;------------------------------------------------------------
+    95                                  print_char:
+    96 0000009B 60                              pusha
+    97 0000009C 0FB61D[01070000]                movzx ebx, byte [current_color]
+    98 000000A3 8B3D[02070000]                  mov edi, [cursor_pos]
+    99 000000A9 89F8                            mov eax, edi
+   100 000000AB D1E8                            shr eax, 1              ; 计算行
+   101                                          ; cursor_pos 已经是字节偏移 (每字符2字节)
+   102 000000AD BF00800B00                      mov edi, VIDEO_MEM
+   103 000000B2 033D[02070000]                  add edi, [cursor_pos]
+   104 000000B8 88DC                            mov ah, bl
+   105 000000BA 668907                          mov [edi], ax
+   106 000000BD A1[02070000]                    mov eax, [cursor_pos]
+   107 000000C2 83C002                          add eax, 2
+   108 000000C5 A3[02070000]                    mov [cursor_pos], eax
+   109 000000CA 61                              popa
+   110 000000CB C3                              ret
+   111                                  
+   112                                  print_newline:
+   113 000000CC 60                              pusha
+   114 000000CD A1[02070000]                    mov eax, [cursor_pos]
+   115 000000D2 B9A0000000                      mov ecx, 160
+   116 000000D7 31D2                            xor edx, edx
+   117 000000D9 F7F1                            div ecx
+   118 000000DB 40                              inc eax
+   119 000000DC 0FAFC1                          imul eax, ecx
+   120 000000DF A3[02070000]                    mov [cursor_pos], eax
+   121 000000E4 61                              popa
+   122 000000E5 C3                              ret
+   123                                  
+   124                                  ;------------------------------------------------------------
+   125                                  ; PIC 重映射: IRQ -> 中断向量 0x20-0x2F
+   126                                  ;------------------------------------------------------------
+   127                                  remap_pic:
+   128 000000E6 60                              pusha
+   129 000000E7 B011                            mov al, 0x11
+   130 000000E9 E620                            out 0x20, al
+   131 000000EB E6A0                            out 0xA0, al
+   132 000000ED B020                            mov al, 0x20            ; 主片偏移 0x20
+   133 000000EF E621                            out 0x21, al
+   134 000000F1 B028                            mov al, 0x28            ; 从片偏移 0x28
+   135 000000F3 E6A1                            out 0xA1, al
+   136 000000F5 B004                            mov al, 0x04
+   137 000000F7 E621                            out 0x21, al
+   138 000000F9 B002                            mov al, 0x02
+   139 000000FB E6A1                            out 0xA1, al
+   140 000000FD B001                            mov al, 0x01
+   141 000000FF E621                            out 0x21, al
+   142 00000101 E6A1                            out 0xA1, al
+   143                                          ; 只启用 IRQ0(时钟)和IRQ1(键盘)
+   144 00000103 B0FC                            mov al, 0xFC
+   145 00000105 E621                            out 0x21, al
+   146 00000107 B0FF                            mov al, 0xFF
+   147 00000109 E6A1                            out 0xA1, al
+   148 0000010B 61                              popa
+   149 0000010C C3                              ret
+   150                                  
+   151                                  ;------------------------------------------------------------
+   152                                  ; PIT 定时器: 100Hz (divisor = 1193180/100 = 11932)
+   153                                  ;------------------------------------------------------------
+   154                                  init_timer:
+   155 0000010D 60                              pusha
+   156 0000010E B036                            mov al, 0x36
+   157 00000110 E643                            out 0x43, al
+   158 00000112 66B89C2E                        mov ax, 11932
+   159 00000116 E640                            out 0x40, al
+   160 00000118 88E0                            mov al, ah
+   161 0000011A E640                            out 0x40, al
+   162 0000011C 61                              popa
+   163 0000011D C3                              ret
+   164                                  
+   165                                  ;------------------------------------------------------------
+   166                                  ; 清空键盘缓冲
+   167                                  ;------------------------------------------------------------
+   168                                  clear_kb_buf:
+   169 0000011E 60                              pusha
+   170                                  .check:
+   171 0000011F E464                            in al, 0x64
+   172 00000121 A801                            test al, 1
+   173 00000123 7404                            jz .done
+   174 00000125 E460                            in al, 0x60
+   175 00000127 EBF6                            jmp .check
+   176                                  .done:
+   177 00000129 61                              popa
+   178 0000012A C3                              ret
+   179                                  
+   180                                  ;------------------------------------------------------------
+   181                                  ; IDT 设置
+   182                                  ;------------------------------------------------------------
+   183                                  setup_idt:
+   184 0000012B 60                              pusha
+   185                                          ; 零填充 IDT
+   186 0000012C BF[50070000]                    mov edi, idt_entries
+   187 00000131 B900010000                      mov ecx, 256
+   188 00000136 31C0                            xor eax, eax
+   189 00000138 BB08000000                      mov ebx, 8
+   190                                  .zero:
+   191 0000013D 8907                            mov [edi], eax
+   192 0000013F 01DF                            add edi, ebx
+   193 00000141 E2FA                            loop .zero
+   194                                  
+   195                                          ; 装 3 个中断向量
+   196 00000143 B8[A3010000]                    mov eax, isr_default
+   197 00000148 BB00000000                      mov ebx, 0x00
+   198 0000014D E820000000                      call set_idt_entry
+   199                                  
+   200 00000152 B8[A6010000]                    mov eax, irq0_handler
+   201 00000157 BB20000000                      mov ebx, 0x20
+   202 0000015C E811000000                      call set_idt_entry
+   203                                  
+   204 00000161 B8[B3010000]                    mov eax, irq1_handler
+   205 00000166 BB21000000                      mov ebx, 0x21
+   206 0000016B E802000000                      call set_idt_entry
+   207                                  
+   208 00000170 61                              popa
+   209 00000171 C3                              ret
+   210                                  
+   211                                  ; 设置 IDT 条目
+   212                                  ;   eax = 处理函数地址, ebx = 向量号
+   213                                  set_idt_entry:
+   214 00000172 50                              push eax
+   215 00000173 53                              push ebx
+   216                                          ; idt_entries + 向量号*8
+   217 00000174 BF[50070000]                    mov edi, idt_entries
+   218 00000179 89D9                            mov ecx, ebx
+   219 0000017B C1E103                          shl ecx, 3
+   220 0000017E 01CF                            add edi, ecx
+   221                                  
+   222                                          ; offset 低16位
+   223 00000180 89C1                            mov ecx, eax
+   224 00000182 81E1FFFF0000                    and ecx, 0xFFFF
+   225 00000188 66890F                          mov word [edi], cx
+   226                                          ; 段选择子 0x08
+   227 0000018B 66C747020800                    mov word [edi+2], 0x08
+   228                                          ; 标志: 中断门 DPL0
+   229 00000191 C647048E                        mov byte [edi+4], 0x8E
+   230                                          ; 保留
+   231 00000195 C6470500                        mov byte [edi+5], 0x00
+   232                                          ; offset 高16位
+   233 00000199 C1E810                          shr eax, 16
+   234 0000019C 66894706                        mov word [edi+6], ax
+   235 000001A0 5B                              pop ebx
+   236 000001A1 58                              pop eax
+   237 000001A2 C3                              ret
+   238                                  
+   239                                  ;------------------------------------------------------------
+   240                                  ; 中断处理函数
+   241                                  ;------------------------------------------------------------
+   242                                  isr_default:
+   243 000001A3 60                              pusha
+   244                                          ; 忽略
+   245 000001A4 61                              popa
+   246 000001A5 CF                              iret
+   247                                  
+   248                                  irq0_handler:
+   249 000001A6 60                              pusha
+   250 000001A7 FF05[0A070000]                  inc dword [timer_ticks]
+   251 000001AD B020                            mov al, 0x20
+   252 000001AF E620                            out 0x20, al            ; EOI
+   253 000001B1 61                              popa
+   254 000001B2 CF                              iret
+   255                                  
+   256                                  irq1_handler:
+   257 000001B3 60                              pusha
+   258 000001B4 E460                            in al, 0x60             ; 扫描码
+   259 000001B6 A880                            test al, 0x80
+   260 000001B8 750A                            jnz .eoi
+   261 000001BA A2[0E070000]                    mov [last_scan], al
+   262 000001BF E806000000                      call handle_key
+   263                                  .eoi:
+   264 000001C4 B020                            mov al, 0x20
+   265 000001C6 E620                            out 0x20, al
+   266 000001C8 61                              popa
+   267 000001C9 CF                              iret
+   268                                  
+   269                                  ;------------------------------------------------------------
+   270                                  ; handle_key: 扫描码 -> 输入处理
+   271                                  ;------------------------------------------------------------
+   272                                  handle_key:
+   273 000001CA 60                              pusha
+   274                                  
+   275 000001CB 0FB605[0E070000]                movzx eax, byte [last_scan]
+   276                                  
+   277                                          ; 回车 (0x1C)
+   278 000001D2 3C1C                            cmp al, 0x1C
+   279 000001D4 7439                            je .enter
+   280                                  
+   281                                          ; 退格 (0x0E) - 简化处理, 清命令
+   282 000001D6 3C0E                            cmp al, 0x0E
+   283 000001D8 7435                            je .enter
+   284                                  
+   285                                          ; 只接受字母数字区 (0x02-0x35 之间), 用表转换
+   286 000001DA 3C35                            cmp al, 0x35
+   287 000001DC 7740                            ja .done
+   288 000001DE 0FB6C0                          movzx eax, al
+   289 000001E1 8A98[C7060000]                  mov bl, [scan_table + eax]
+   290 000001E7 80FB00                          cmp bl, 0
+   291 000001EA 7432                            je .done
+   292                                  
+   293                                          ; 加入到命令缓冲
+   294 000001EC 8B0D[06070000]                  mov ecx, [cmd_len]
+   295 000001F2 83F93F                          cmp ecx, 63
+   296 000001F5 7327                            jae .done
+   297 000001F7 BF[0F070000]                    mov edi, cmd_buffer
+   298 000001FC 01CF                            add edi, ecx
+   299 000001FE 881F                            mov [edi], bl
+   300 00000200 FF05[06070000]                  inc dword [cmd_len]
+   301                                  
+   302                                          ; 打印字符
+   303 00000206 88D8                            mov al, bl
+   304 00000208 E88EFEFFFF                      call print_char
+   305                                  
+   306 0000020D EB0F                            jmp .done
+   307                                  
+   308                                  .enter:
+   309 0000020F E8B8FEFFFF                      call print_newline
+   310 00000214 E833000000                      call execute_command
+   311 00000219 E802000000                      call print_prompt
+   312                                  
+   313                                  .done:
+   314 0000021E 61                              popa
+   315 0000021F C3                              ret
+   316                                  
+   317                                  ;------------------------------------------------------------
+   318                                  ; print_prompt
+   319                                  ;------------------------------------------------------------
+   320                                  print_prompt:
+   321 00000220 60                              pusha
+   322 00000221 BE[7D060000]                    mov esi, MSG_PROMPT
+   323 00000226 C605[01070000]0B                mov byte [current_color], 0x0B
+   324 0000022D E84FFEFFFF                      call print_string
+   325                                          ; 清命令缓冲
+   326 00000232 C705[06070000]0000-             mov dword [cmd_len], 0
+   326 0000023A 0000               
+   327 0000023C BF[0F070000]                    mov edi, cmd_buffer
+   328 00000241 B940000000                      mov ecx, 64
+   329 00000246 31C0                            xor eax, eax
+   330 00000248 F3AA                            rep stosb
+   331 0000024A 61                              popa
+   332 0000024B C3                              ret
+   333                                  
+   334                                  ;------------------------------------------------------------
+   335                                  ; execute_command
+   336                                  ;------------------------------------------------------------
+   337                                  execute_command:
+   338 0000024C 60                              pusha
+   339                                  
+   340 0000024D A1[06070000]                    mov eax, [cmd_len]
+   341 00000252 83F800                          cmp eax, 0
+   342 00000255 0F840A010000                    je .done
+   343                                  
+   344                                          ; help
+   345 0000025B 8D35[0F070000]                  lea esi, [cmd_buffer]
+   346 00000261 8D3D[9D060000]                  lea edi, [CMD_HELP]
+   347 00000267 E84C010000                      call str_cmp
+   348 0000026C 0F8491000000                    je .cmd_help
+   349                                  
+   350 00000272 8D35[0F070000]                  lea esi, [cmd_buffer]
+   351 00000278 8D3D[A2060000]                  lea edi, [CMD_ABOUT]
+   352 0000027E E835010000                      call str_cmp
+   353 00000283 0F848D000000                    je .cmd_about
+   354                                  
+   355 00000289 8D35[0F070000]                  lea esi, [cmd_buffer]
+   356 0000028F 8D3D[A8060000]                  lea edi, [CMD_INFO]
+   357 00000295 E81E010000                      call str_cmp
+   358 0000029A 0F8489000000                    je .cmd_info
+   359                                  
+   360 000002A0 8D35[0F070000]                  lea esi, [cmd_buffer]
+   361 000002A6 8D3D[AD060000]                  lea edi, [CMD_CLEAR]
+   362 000002AC E807010000                      call str_cmp
+   363 000002B1 0F8485000000                    je .cmd_clear
+   364                                  
+   365 000002B7 8D35[0F070000]                  lea esi, [cmd_buffer]
+   366 000002BD 8D3D[B3060000]                  lea edi, [CMD_UPTIME]
+   367 000002C3 E8F0000000                      call str_cmp
+   368 000002C8 7479                            je .cmd_uptime
+   369                                  
+   370 000002CA 8D35[0F070000]                  lea esi, [cmd_buffer]
+   371 000002D0 8D3D[BA060000]                  lea edi, [CMD_HELLO]
+   372 000002D6 E8DD000000                      call str_cmp
+   373 000002DB 746D                            je .cmd_hello
+   374                                  
+   375 000002DD 8D35[0F070000]                  lea esi, [cmd_buffer]
+   376 000002E3 8D3D[C0060000]                  lea edi, [CMD_REBOOT]
+   377 000002E9 E8CA000000                      call str_cmp
+   378 000002EE 746D                            je .cmd_reboot
+   379                                  
+   380                                          ; 未知
+   381 000002F0 BE[5A060000]                    mov esi, MSG_UNKNOWN
+   382 000002F5 C605[01070000]0C                mov byte [current_color], 0x0C
+   383 000002FC E880FDFFFF                      call print_string
+   384 00000301 EB62                            jmp .done
+   385                                  
+   386                                  .cmd_help:
+   387 00000303 BE[62040000]                    mov esi, MSG_HELP_FULL
+   388 00000308 C605[01070000]0B                mov byte [current_color], 0x0B
+   389 0000030F E86DFDFFFF                      call print_string
+   390 00000314 EB4F                            jmp .done
+   391                                  
+   392                                  .cmd_about:
+   393 00000316 BE[25050000]                    mov esi, MSG_ABOUT
+   394 0000031B C605[01070000]0A                mov byte [current_color], 0x0A
+   395 00000322 E85AFDFFFF                      call print_string
+   396 00000327 EB3C                            jmp .done
+   397                                  
+   398                                  .cmd_info:
+   399 00000329 BE[A6050000]                    mov esi, MSG_INFO
+   400 0000032E C605[01070000]0A                mov byte [current_color], 0x0A
+   401 00000335 E847FDFFFF                      call print_string
+   402 0000033A EB29                            jmp .done
+   403                                  
+   404                                  .cmd_clear:
+   405 0000033C E822FDFFFF                      call clear_screen
+   406 00000341 EB22                            jmp .done
+   407                                  
+   408                                  .cmd_uptime:
+   409 00000343 E81F000000                      call print_uptime
+   410 00000348 EB1B                            jmp .done
+   411                                  
+   412                                  .cmd_hello:
+   413 0000034A BE[34060000]                    mov esi, MSG_HELLO
+   414 0000034F C605[01070000]0E                mov byte [current_color], 0x0E
+   415 00000356 E826FDFFFF                      call print_string
+   416 0000035B EB08                            jmp .done
+   417                                  
+   418                                  .cmd_reboot:
+   419 0000035D B0FE                            mov al, 0xFE
+   420 0000035F E664                            out 0x64, al
+   421 00000361 EBFE                            jmp $
+   422 00000363 EB00                            jmp .done
+   423                                  
+   424                                  .done:
+   425 00000365 61                              popa
+   426 00000366 C3                              ret
+   427                                  
+   428                                  ;------------------------------------------------------------
+   429                                  ; print_uptime: 显示运行秒数
+   430                                  ;------------------------------------------------------------
+   431                                  print_uptime:
+   432 00000367 60                              pusha
+   433 00000368 BE[86060000]                    mov esi, MSG_UPTIME_PREFIX
+   434 0000036D C605[01070000]0A                mov byte [current_color], 0x0A
+   435 00000374 E808FDFFFF                      call print_string
+   436                                  
+   437                                          ; ticks -> 秒 (100Hz)
+   438 00000379 A1[0A070000]                    mov eax, [timer_ticks]
+   439 0000037E BB64000000                      mov ebx, 100
+   440 00000383 31D2                            xor edx, edx
+   441 00000385 F7F3                            div ebx
+   442                                          ; 现在 eax = 秒
+   443 00000387 31C9                            xor ecx, ecx
+   444 00000389 BB0A000000                      mov ebx, 10
+   445                                  .div:
+   446 0000038E 31D2                            xor edx, edx
+   447 00000390 F7F3                            div ebx
+   448 00000392 52                              push edx
+   449 00000393 41                              inc ecx
+   450 00000394 85C0                            test eax, eax
+   451 00000396 75F6                            jnz .div
+   452                                  .disp:
+   453 00000398 5A                              pop edx
+   454 00000399 80C230                          add dl, '0'
+   455 0000039C 88D0                            mov al, dl
+   456 0000039E E8F8FCFFFF                      call print_char
+   457 000003A3 E2F3                            loop .disp
+   458                                  
+   459 000003A5 BE[92060000]                    mov esi, MSG_UPTIME_SUFFIX
+   460 000003AA C605[01070000]0A                mov byte [current_color], 0x0A
+   461 000003B1 E8CBFCFFFF                      call print_string
+   462 000003B6 61                              popa
+   463 000003B7 C3                              ret
+   464                                  
+   465                                  ;------------------------------------------------------------
+   466                                  ; str_cmp: ESI/EDI 指向字符串, 相等则 ZF=1
+   467                                  ;------------------------------------------------------------
+   468                                  str_cmp:
+   469 000003B8 56                              push esi
+   470 000003B9 57                              push edi
+   471                                  .loop:
+   472 000003BA 8A06                            mov al, [esi]
+   473 000003BC 8A1F                            mov bl, [edi]
+   474 000003BE 38D8                            cmp al, bl
+   475 000003C0 7508                            jne .ne
+   476 000003C2 3C00                            cmp al, 0
+   477 000003C4 740A                            je .eq
+   478 000003C6 46                              inc esi
+   479 000003C7 47                              inc edi
+   480 000003C8 EBF0                            jmp .loop
+   481                                  .ne:
+   482 000003CA 5F                              pop edi
+   483 000003CB 5E                              pop esi
+   484 000003CC 83C801                          or eax, 0x01
+   485 000003CF C3                              ret
+   486                                  .eq:
+   487 000003D0 5F                              pop edi
+   488 000003D1 5E                              pop esi
+   489 000003D2 31C0                            xor eax, eax
+   490 000003D4 C3                              ret
+   491                                  
+   492                                  ;------------------------------------------------------------
+   493                                  ; 数据区
+   494                                  ;------------------------------------------------------------
+   495                                  VIDEO_MEM      equ 0x000B8000
+   496                                  
+   497 000003D5 0A20204D696E694F53-     MSG_LOGO   db 0x0A, "  MiniOS v1.0 - tiny 32-bit OS", 0x0D, 0x0A
+   497 000003DE 2076312E30202D2074-
+   497 000003E7 696E792033322D6269-
+   497 000003F0 74204F530D0A       
+   498 000003F6 20206279204247374F-                db  "  by BG7OOC", 0x0D, 0x0A, 0
+   498 000003FF 4F430D0A00         
+   499                                  
+   500 00000404 0A2020426F6F74696E-     MSG_BANNER db 0x0A, "  Booting complete.", 0x0D, 0x0A
+   500 0000040D 6720636F6D706C6574-
+   500 00000416 652E0D0A           
+   501 0000041A 202054696D65723A20-                db  "  Timer: 100Hz  all systems nominal", 0x0D, 0x0A, 0
+   501 00000423 313030487A2020616C-
+   501 0000042C 6C2073797374656D73-
+   501 00000435 206E6F6D696E616C0D-
+   501 0000043E 0A00               
+   502                                  
+   503 00000440 0A2020547970652027-     MSG_HINT   db 0x0A, "  Type 'help' to see commands.", 0x0D, 0x0A, 0
+   503 00000449 68656C702720746F20-
+   503 00000452 73656520636F6D6D61-
+   503 0000045B 6E64732E0D0A00     
+   504                                  
+   505 00000462 0A2020436F6D6D616E-     MSG_HELP_FULL db 0x0A, "  Commands:", 0x0D, 0x0A
+   505 0000046B 64733A0D0A         
+   506 00000470 2020202068656C7020-                db "    help    show commands", 0x0D, 0x0A
+   506 00000479 20202073686F772063-
+   506 00000482 6F6D6D616E64730D0A 
+   507 0000048B 2020202061626F7574-                db "    about   about MiniOS", 0x0D, 0x0A
+   507 00000494 20202061626F757420-
+   507 0000049D 4D696E694F530D0A   
+   508 000004A5 20202020696E666F20-                db "    info    system info", 0x0D, 0x0A
+   508 000004AE 20202073797374656D-
+   508 000004B7 20696E666F0D0A     
+   509 000004BE 20202020636C656172-                db "    clear   clear screen", 0x0D, 0x0A
+   509 000004C7 202020636C65617220-
+   509 000004D0 73637265656E0D0A   
+   510 000004D8 20202020757074696D-                db "    uptime  show uptime", 0x0D, 0x0A
+   510 000004E1 65202073686F772075-
+   510 000004EA 7074696D650D0A     
+   511 000004F1 2020202068656C6C6F-                db "    hello   greeting", 0x0D, 0x0A
+   511 000004FA 202020677265657469-
+   511 00000503 6E670D0A           
+   512 00000507 202020207265626F6F-                db "    reboot  restart machine", 0x0D, 0x0A, 0
+   512 00000510 742020726573746172-
+   512 00000519 74206D616368696E65-
+   512 00000522 0D0A00             
+   513                                  
+   514 00000525 0A20204D696E694F53-     MSG_ABOUT db 0x0A, "  MiniOS is a tiny OS written in x86 assembly.", 0x0D, 0x0A
+   514 0000052E 20697320612074696E-
+   514 00000537 79204F532077726974-
+   514 00000540 74656E20696E207838-
+   514 00000549 3620617373656D626C-
+   514 00000552 792E0D0A           
+   515 00000556 202052756E7320696E-               db "  Runs in 32-bit protected mode.", 0x0D, 0x0A
+   515 0000055F 2033322D6269742070-
+   515 00000568 726F74656374656420-
+   515 00000571 6D6F64652E0D0A     
+   516 00000578 202046656174757265-               db "  Features: VGA, PIC, PIT, keyboard, shell.", 0x0D, 0x0A, 0
+   516 00000581 733A205647412C2050-
+   516 0000058A 49432C205049542C20-
+   516 00000593 6B6579626F6172642C-
+   516 0000059C 207368656C6C2E0D0A-
+   516 000005A5 00                 
+   517                                  
+   518 000005A6 0A2020435055202020-     MSG_INFO db 0x0A, "  CPU      :  32-bit Protected Mode", 0x0D, 0x0A
+   518 000005AF 2020203A202033322D-
+   518 000005B8 6269742050726F7465-
+   518 000005C1 63746564204D6F6465-
+   518 000005CA 0D0A               
+   519 000005CC 2020446973706C6179-              db "  Display  :  VGA Txt 80x25", 0x0D, 0x0A
+   519 000005D5 20203A202056474120-
+   519 000005DE 547874203830783235-
+   519 000005E7 0D0A               
+   520 000005E9 202054696D65722020-              db "  Timer    :  PIT @100Hz", 0x0D, 0x0A
+   520 000005F2 20203A202050495420-
+   520 000005FB 40313030487A0D0A   
+   521 00000603 20204B6579626F6172-              db "  Keyboard :  IRQ1 PS/2", 0x0D, 0x0A
+   521 0000060C 64203A202049525131-
+   521 00000615 2050532F320D0A     
+   522 0000061C 20204B65726E656C20-              db "  Kernel   :  0x10000", 0x0D, 0x0A, 0
+   522 00000625 20203A202030783130-
+   522 0000062E 3030300D0A00       
+   523                                  
+   524 00000634 0A202048656C6C6F20-     MSG_HELLO  db 0x0A, "  Hello there! Have a nice day. =)", 0x0D, 0x0A, 0
+   524 0000063D 746865726521204861-
+   524 00000646 76652061206E696365-
+   524 0000064F 206461792E203D290D-
+   524 00000658 0A00               
+   525 0000065A 0A2020556E6B6E6F77-     MSG_UNKNOWN db 0x0A, "  Unknown command. Type 'help'.", 0x0D, 0x0A, 0
+   525 00000663 6E20636F6D6D616E64-
+   525 0000066C 2E2054797065202768-
+   525 00000675 656C70272E0D0A00   
+   526 0000067D 4D696E694F533E2000      MSG_PROMPT db "MiniOS> ", 0
+   527 00000686 0A2020557074696D65-     MSG_UPTIME_PREFIX db 0x0A, "  Uptime: ", 0
+   527 0000068F 3A2000             
+   528 00000692 207365636F6E64730D-     MSG_UPTIME_SUFFIX db " seconds", 0x0D, 0x0A, 0
+   528 0000069B 0A00               
+   529                                  
+   530 0000069D 68656C7000              CMD_HELP   db "help", 0
+   531 000006A2 61626F757400            CMD_ABOUT  db "about", 0
+   532 000006A8 696E666F00              CMD_INFO   db "info", 0
+   533 000006AD 636C65617200            CMD_CLEAR  db "clear", 0
+   534 000006B3 757074696D6500          CMD_UPTIME db "uptime", 0
+   535 000006BA 68656C6C6F00            CMD_HELLO  db "hello", 0
+   536 000006C0 7265626F6F7400          CMD_REBOOT db "reboot", 0
+   537                                  
+   538                                  ; 扫描码 -> ASCII (US QWERTY, 前0x3A)
+   539                                  scan_table:
+   540 000006C7 001B31323334353637-             db 0, 27, '1','2','3','4','5','6','7','8','9','0','-','='
+   540 000006D0 3839302D3D         
+   541 000006D5 080971776572747975-             db 8, 9, 'q','w','e','r','t','y','u','i','o','p','[',']'
+   541 000006DE 696F705B5D         
+   542 000006E3 0D006173646667686A-             db 13, 0, 'a','s','d','f','g','h','j','k','l',';',''''
+   542 000006EC 6B6C3B00           
+   543 000006F0 60005C7A786376626E-             db '`', 0, '\','z','x','c','v','b','n','m',',','.','/'
+   543 000006F9 6D2C2E2F           
+   544 000006FD 002A0020                        db 0, '*', 0, ' '
+   545                                  
+   546                                  ; 变量
+   547 00000701 1F                      current_color db 0x1F
+   548 00000702 00000000                cursor_pos    dd 0
+   549 00000706 00000000                cmd_len       dd 0
+   550 0000070A 00000000                timer_ticks   dd 0
+   551 0000070E 00                      last_scan     db 0
+   552 0000070F 00<rep 40h>             cmd_buffer    times 64 db 0
+   553                                  
+   554                                  ;------------------------------------------------------------
+   555                                  ; IDT: 放最后 (相对地址直接寻址, 位置固定)
+   556                                  ;------------------------------------------------------------
+   557 0000074F 90                      align 8
+   558 00000750 00<rep 800h>            idt_entries  times 256*8 db 0
+   559                                  
+   560                                  idt_descriptor:
+   561 00000F50 FF07                            dw 256*8 - 1
+   562 00000F52 [50070000]                      dd idt_entries
+   563                                  
+   564                                  ; 填充到 32KB 边界 (boot 加载 64 扇区)
+   565 00000F56 00<rep 70AAh>           times (64*512 - ($-$$)) db 0
